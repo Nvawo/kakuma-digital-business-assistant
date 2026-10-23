@@ -1,4 +1,6 @@
 import { useEffect, useState } from 'react'
+import Auth from './Auth'
+import { supabase } from './supabase'
 
 const initialSales = [
   { id: 'SAL-001', customer: 'Amina Hassan', item: 'Cooking Oil', amount: 2500, status: 'Completed', date: '2026-10-01' },
@@ -40,7 +42,6 @@ const expenseCategories = [
   'Salaries',
   'Other',
 ]
-
 function formatMoney(amount) {
   return `KSh ${amount.toLocaleString('en-KE', {
     maximumFractionDigits: 2,
@@ -97,18 +98,93 @@ function StatusBadge({ status }) {
   )
 }
 
-function App() {
-  const [activePage, setActivePage] = useState('Dashboard')
-  const [sales, setSales] = usePersistentState(
-    'kakuma-business-sales',
+function BusinessApp({ userId, onSignOut }) {
+  const [businessId, setBusinessId] = useState(null)
+  const [businessLoading, setBusinessLoading] = useState(true) 
+  useEffect(() => {
+    let cancelled = false
+
+    async function loadBusiness() {
+      setBusinessLoading(true)
+
+      const { data, error } = await supabase
+        .from('business_members')
+        .select('business_id')
+        .eq('user_id', userId)
+        .eq('role', 'owner')
+        .limit(1)
+        .maybeSingle()
+
+      if (cancelled) return
+
+      if (error) {
+        console.error('Unable to load business:', error.message)
+        setBusinessId(null)
+      } else {
+        setBusinessId(data?.business_id ?? null)
+      }
+
+      setBusinessLoading(false)
+    }
+
+    loadBusiness()
+
+    return () => {
+      cancelled = true
+    }
+  }, [userId])
+   const [activePage, setActivePage] = useState('Dashboard')
+   const [sales, setSales] = usePersistentState(
+    `kakuma-business-sales-${userId}`,
     initialSales,
   )
-  const [products, setProducts] = usePersistentState(
-    'kakuma-business-products',
-    initialProducts,
-  )
+  const [products, setProducts] = useState([])
+  const [productsLoading, setProductsLoading] = useState(true)
+  useEffect(() => {
+    let cancelled = false
+
+    async function loadProducts() {
+      if (!businessId) {
+        setProducts([])
+        setProductsLoading(false)
+        return
+      }
+
+      setProductsLoading(true)
+
+      const { data, error } = await supabase
+        .from('products')
+        .select('id, name, category, price, stock, low_stock_threshold')
+        .eq('business_id', businessId)
+        .order('name')
+
+      if (cancelled) return
+
+      if (error) {
+        console.error('Unable to load products:', error.message)
+        setInventoryMessage('Unable to load inventory from the database.')
+        setInventoryError(true)
+      } else {
+        setProducts(
+          data.map((product) => ({
+            ...product,
+            price: Number(product.price),
+            stock: Number(product.stock),
+          })),
+        )
+      }
+
+      setProductsLoading(false)
+    }
+
+    loadProducts()
+
+    return () => {
+      cancelled = true
+    }
+  }, [businessId])
   const [expenses, setExpenses] = usePersistentState(
-    'kakuma-business-expenses',
+    `kakuma-business-expenses-${userId}`,
     initialExpenses,
   )
 
@@ -116,7 +192,7 @@ function App() {
   const [customerSearch, setCustomerSearch] = useState('')
   const [selectedCustomerHistory, setSelectedCustomerHistory] = useState('')
   const [customerRecords, setCustomerRecords] = usePersistentState(
-    'kakuma-business-customer-records',
+    `kakuma-business-customer-records-${userId}`,
     [],
   )
   const [newCustomerName, setNewCustomerName] = useState('')
@@ -348,7 +424,7 @@ function App() {
     setExpenseMessage('Expense recorded successfully.')
   }
 
-  function handleAddProduct(event) {
+   async function handleAddProduct(event) {
     event.preventDefault()
     setInventoryMessage('')
     setInventoryError(false)
@@ -356,6 +432,12 @@ function App() {
     const name = newProductName.trim()
     const stock = Number(newProductStock)
     const price = Number(newProductPrice)
+
+    if (!businessId) {
+      setInventoryMessage('Your business is not loaded yet. Please try again.')
+      setInventoryError(true)
+      return
+    }
 
     if (!name) {
       setInventoryMessage('Please enter a product name.')
@@ -381,27 +463,50 @@ function App() {
       return
     }
 
-    const product = {
-      name,
-      category: newProductCategory,
-      stock,
-      price,
+    const { data, error } = await supabase
+      .from('products')
+      .insert({
+        business_id: businessId,
+        name,
+        category: newProductCategory,
+        stock,
+        price,
+        low_stock_threshold: 8,
+      })
+      .select('id, name, category, price, stock, low_stock_threshold')
+      .single()
+
+    if (error) {
+      console.error('Unable to add product:', error.message)
+      setInventoryMessage(`Unable to save product: ${error.message}`)
+      setInventoryError(true)
+      return
     }
 
-    setProducts((current) => [...current, product])
+    setProducts((current) => [...current, {
+      ...data,
+      price: Number(data.price),
+      stock: Number(data.stock),
+    }])
     setNewProductName('')
     setNewProductCategory('Food')
     setNewProductStock('0')
     setNewProductPrice('')
-    setInventoryMessage(`${name} added successfully.`)
+    setInventoryMessage(`${name} saved to your business inventory.`)
   }
 
-  function handleRestockProduct(event) {
+   async function handleRestockProduct(event) {
     event.preventDefault()
     setInventoryMessage('')
     setInventoryError(false)
 
     const amount = Number(restockQuantity)
+
+    if (!businessId) {
+      setInventoryMessage('Your business is not loaded yet. Please try again.')
+      setInventoryError(true)
+      return
+    }
 
     if (!restockProduct) {
       setInventoryMessage('Please select a product to restock.')
@@ -415,15 +520,48 @@ function App() {
       return
     }
 
+    const product = products.find(
+      (item) => item.name === restockProduct,
+    )
+
+    if (!product || !product.id) {
+      setInventoryMessage('Product not found in the database.')
+      setInventoryError(true)
+      return
+    }
+
+    const newStock = Number(product.stock) + amount
+
+    const { data, error } = await supabase
+      .from('products')
+      .update({ stock: newStock })
+      .eq('id', product.id)
+      .eq('business_id', businessId)
+      .select('id, name, category, price, stock, low_stock_threshold')
+      .single()
+
+    if (error) {
+      console.error('Unable to restock product:', error.message)
+      setInventoryMessage(`Unable to restock product: ${error.message}`)
+      setInventoryError(true)
+      return
+    }
+
     setProducts((current) =>
-      current.map((product) =>
-        product.name === restockProduct
-          ? { ...product, stock: product.stock + amount }
-          : product,
+      current.map((item) =>
+        item.id === data.id
+          ? {
+              ...data,
+              price: Number(data.price),
+              stock: Number(data.stock),
+            }
+          : item,
       ),
     )
 
-    setInventoryMessage(`${restockProduct} restocked with ${amount} units.`)
+    setInventoryMessage(
+      `${data.name} restocked with ${amount} units. New stock: ${data.stock}.`,
+    )
     setRestockQuantity('1')
   }
   function downloadCsv(filename, headers, rows) {
@@ -529,8 +667,17 @@ function App() {
               Manage your business from one place.
             </p>
           </div>
-          <div className="rounded-xl bg-emerald-50 px-4 py-2 text-sm font-semibold text-emerald-700">
-            Kakuma, Kenya
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="rounded-xl bg-emerald-50 px-4 py-2 text-sm font-semibold text-emerald-700">
+              Kakuma, Kenya
+            </div>
+            <button
+              type="button"
+              onClick={onSignOut}
+              className="rounded-xl border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+            >
+              Sign out
+            </button>
           </div>
         </header>
 
@@ -1505,6 +1652,86 @@ function App() {
         </div>
       </main>
     </div>
+  )
+}
+
+function App() {
+  const [session, setSession] = useState(null)
+  const [checkingSession, setCheckingSession] = useState(true)
+
+  useEffect(() => {
+    let active = true
+
+    async function checkSession() {
+      try {
+        const { data, error } = await supabase.auth.getSession()
+        if (error) throw error
+
+        const currentSession = data.session
+        if (!currentSession) {
+          if (active) setSession(null)
+          return
+        }
+
+        const { data: memberships, error: membershipError } =
+          await supabase
+            .from('business_members')
+            .select('business_id')
+            .eq('user_id', currentSession.user.id)
+            .limit(1)
+
+        if (membershipError) throw membershipError
+
+        if (active) {
+          setSession(memberships?.length ? currentSession : null)
+        }
+      } catch (error) {
+        console.error('Unable to check the signed-in session:', error)
+        if (active) setSession(null)
+      } finally {
+        if (active) setCheckingSession(false)
+      }
+    }
+
+    checkSession()
+    return () => {
+      active = false
+    }
+  }, [])
+
+  async function handleSignedIn() {
+    const { data, error } = await supabase.auth.getSession()
+    if (error) {
+      console.error('Unable to load the signed-in session:', error)
+      return
+    }
+    setSession(data.session)
+  }
+
+  async function handleSignOut() {
+    const { error } = await supabase.auth.signOut()
+    if (error) {
+      console.error('Unable to sign out:', error)
+      return
+    }
+    setSession(null)
+  }
+
+  if (checkingSession) {
+    return (
+      <div className="flex min-h-screen items-center justify-center text-slate-600">
+        Checking your session...
+      </div>
+    )
+  }
+
+  if (!session) return <Auth onSignedIn={handleSignedIn} />
+
+  return (
+    <BusinessApp
+      userId={session.user.id}
+      onSignOut={handleSignOut}
+    />
   )
 }
 
